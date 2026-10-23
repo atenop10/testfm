@@ -2,6 +2,8 @@ import os
 import re
 import html
 import hashlib
+import io
+import json
 import time
 import sqlite3
 import asyncio
@@ -247,6 +249,55 @@ def find_url(obj, depth=0):
     return None
 
 
+def _collect_lists(obj, out, depth=0):
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _collect_lists(v, out, depth + 1)
+    elif isinstance(obj, list):
+        if obj and all(isinstance(x, dict) for x in obj):
+            out.append(obj)
+        for x in obj:
+            _collect_lists(x, out, depth + 1)
+
+
+def find_episode_list(details):
+    """Longest list of dicts anywhere in the response, ignoring the show-info block."""
+    lists = []
+    _collect_lists(details, lists)
+    lists = [l for l in lists if not any("show_title" in x for x in l)]
+    return max(lists, key=len) if lists else []
+
+
+def get_show_name(details):
+    node = details
+    if isinstance(node, dict) and isinstance(node.get("result"), list) and node["result"]:
+        node = node["result"][0]
+    return shallow_find(node, "show_title", "title", "name") or "Episodes"
+
+
+def shape(obj, depth=0):
+    """Compact outline of a JSON structure (long strings trimmed, first list item only)."""
+    pad = "  " * depth
+    if isinstance(obj, dict):
+        out = []
+        for k, v in obj.items():
+            if isinstance(v, dict):
+                out.append(f"{pad}{k}: dict({len(v)})")
+                out.append(shape(v, depth + 1))
+            elif isinstance(v, list):
+                out.append(f"{pad}{k}: list({len(v)})")
+                if v:
+                    out.append(shape(v[0], depth + 1) if isinstance(v[0], (dict, list)) else f"{pad}  [0]: {repr(v[0])[:40]}")
+            else:
+                out.append(f"{pad}{k}: {repr(v)[:40]}")
+        return "\n".join(out)
+    if isinstance(obj, list):
+        return f"{pad}list({len(obj)})\n" + (shape(obj[0], depth + 1) if obj else "")
+    return f"{pad}{repr(obj)[:40]}"
+
+
 SHOW_PARAMS = ("story_id", "show_id", "entity_id")
 PLAYER_KEYS = (("story_id", "episode_id"), ("show_id", "episode_id"),
                ("entity_id", "episode_id"), ("show_id", "entity_id"))
@@ -264,10 +315,10 @@ async def fetch_show_details(show_id: str):
             last_err = e
             continue
         details = payload.get("data", payload) if isinstance(payload, dict) else {}
-        episodes = [e for e in find_list(details) if isinstance(e, dict)]
+        episodes = find_episode_list(details)
         if episodes:
             SHOW_PARAMS = (p,) + tuple(x for x in SHOW_PARAMS if x != p)
-            name = shallow_find(details, "title", "name", "show_title") or "Episodes"
+            name = get_show_name(details)
             return name, episodes
         logger.warning("show-details with %s returned no episodes: %s", p, str(payload)[:400])
     raise last_err or ApiError("No episodes found (admin: try /debugshow)")
@@ -396,10 +447,10 @@ def episode_keyboard(show_id: str, episodes: list, page: int) -> InlineKeyboardM
     start = page * PAGE_SIZE
     rows = []
     for i, ep in enumerate(episodes[start:start + PAGE_SIZE], start=start + 1):
-        ep_id = first(ep, "entity_id", "id", "episode_id")
+        ep_id = first(ep, "entity_id", "story_id", "id", "episode_id")
         if ep_id is None:
             continue
-        title = first(ep, "title", "episode_title", "name") or f"Episode {first(ep, 'episode_number', 'number', default=i)}"
+        title = first(ep, "title", "story_title", "episode_title", "name") or f"Episode {first(ep, 'episode_number', 'number', default=i)}"
         rows.append([InlineKeyboardButton(f"⬇️ {str(title)[:38]}", callback_data=f"dl|{ks}|{reg(ep_id)}")])
     nav = []
     if page > 0:
@@ -457,8 +508,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             audio_url, raw_title = await fetch_player(show_id, ep_id)
             if not raw_title:
                 for ep in cache.get(show_id, {}).get("episodes", []):
-                    if str(first(ep, "entity_id", "id", "episode_id")) == ep_id:
-                        raw_title = first(ep, "title", "episode_title", "name")
+                    if str(first(ep, "entity_id", "story_id", "id", "episode_id")) == ep_id:
+                        raw_title = first(ep, "title", "story_title", "episode_title", "name")
                         break
             raw_title = raw_title or f"Episode_{ep_id[:8]}"
             if not audio_url:
@@ -568,6 +619,14 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{type(e).__name__}: {e}")
 
 
+async def send_debug(update: Update, payload, label: str):
+    outline = shape(payload)
+    await update.message.reply_text(
+        f"<b>{esc(label)}</b>\n<pre>{esc(outline[:3500])}</pre>", parse_mode=ParseMode.HTML)
+    raw = json.dumps(payload, ensure_ascii=False, indent=1).encode()
+    await update.message.reply_document(io.BytesIO(raw), filename="response.json")
+
+
 async def debugshow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin only: /debugshow <show_entity_id> dumps raw show-details response."""
     if not is_admin(update) or not context.args:
@@ -576,7 +635,7 @@ async def debugshow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for p in SHOW_PARAMS:
         try:
             payload = await api_request("GET", "/show-details-story", params={p: sid})
-            await update.message.reply_text(f"<b>param={p}</b>\n<pre>{esc(str(payload)[:3300])}</pre>", parse_mode=ParseMode.HTML)
+            await send_debug(update, payload, f"param={p}")
             return
         except Exception as e:
             await update.message.reply_text(f"param={p}: {type(e).__name__}: {e}")
@@ -590,7 +649,7 @@ async def debugplay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for ks, ke in PLAYER_KEYS:
         try:
             payload = await api_request("POST", "/player", json={ks: sid, ke: eid})
-            await update.message.reply_text(f"<b>{ks}/{ke}</b>\n<pre>{esc(str(payload)[:3300])}</pre>", parse_mode=ParseMode.HTML)
+            await send_debug(update, payload, f"{ks}/{ke}")
             return
         except Exception as e:
             await update.message.reply_text(f"{ks}/{ke}: {type(e).__name__}: {e}")
