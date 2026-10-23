@@ -20,6 +20,8 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,7 +35,14 @@ SEARCH_PATH = os.getenv("SEARCH_PATH", "/universal-search")
 SEARCH_PARAM = os.getenv("SEARCH_PARAM", "query")   # change if your curl uses q / keyword / search
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 FORCE_IPV4 = os.getenv("FORCE_IPV4", "1") == "1"
-PAGE_SIZE = 8
+MAX_BATCH = int(os.getenv("MAX_BATCH", "20"))   # max episodes per request
+EPISODE_CACHE_TTL = 3600
+# --- episode pagination (the API returns only ~8 episodes per page) ---
+EPISODE_PAGE_PARAM = os.getenv("EPISODE_PAGE_PARAM", "").strip()    # pin the page param name, e.g. page / offset
+EPISODE_PAGE_MODE = os.getenv("EPISODE_PAGE_MODE", "page").strip()  # "page" (1,2,3..) or "offset" (0,8,16..) when pinned
+EPISODE_LIMIT_PARAM = os.getenv("EPISODE_LIMIT_PARAM", "").strip()  # optional page-size param, e.g. limit / per_page
+EPISODE_LIMIT = int(os.getenv("EPISODE_LIMIT", "100"))
+MAX_EPISODE_PAGES = int(os.getenv("MAX_EPISODE_PAGES", "200"))
 MAX_UPLOAD_MB = 50
 
 if not BOT_TOKEN or not API_KEY:
@@ -166,7 +175,12 @@ async def api_request(method: str, path: str, *, params=None, json=None):
 
         if resp.status_code >= 400:
             logger.error("API body: %s", resp.text[:500])
-            raise ApiError(f"API returned HTTP {resp.status_code}", resp.status_code)
+            try:
+                j = resp.json()
+                detail = str(j.get("message") or j.get("error") or j.get("errors") or j) if isinstance(j, dict) else str(j)
+            except ValueError:
+                detail = resp.text
+            raise ApiError(f"API returned HTTP {resp.status_code}: {detail[:200]}", resp.status_code)
         try:
             return resp.json()
         except ValueError:
@@ -277,6 +291,13 @@ def get_show_name(details):
     return shallow_find(node, "show_title", "title", "name") or "Episodes"
 
 
+def get_sort_order(details):
+    node = details
+    if isinstance(node, dict) and isinstance(node.get("result"), list) and node["result"]:
+        node = node["result"][0]
+    return str(shallow_find(node, "sort_order") or "asc").lower()
+
+
 def shape(obj, depth=0):
     """Compact outline of a JSON structure (long strings trimmed, first list item only)."""
     pad = "  " * depth
@@ -299,27 +320,116 @@ def shape(obj, depth=0):
 
 
 SHOW_PARAMS = ("story_id", "show_id", "entity_id")
-PLAYER_KEYS = (("story_id", "episode_id"), ("show_id", "episode_id"),
-               ("entity_id", "episode_id"), ("show_id", "entity_id"))
+PLAYER_KEYS = (
+    (("show_id", "S"), ("story_id", "E")),
+    (("story_id", "S"), ("episode_id", "E")),
+    (("show_id", "S"), ("episode_id", "E")),
+    (("entity_id", "S"), ("episode_id", "E")),
+    (("story_id", "E"),),
+    (("episode_id", "E"),),
+    (("entity_id", "E"),),
+)
 
 
-async def fetch_show_details(show_id: str):
+def player_body(tpl, show_id, ep_id):
+    return {k: (show_id if v == "S" else ep_id) for k, v in tpl}
+
+
+PAGE_MODES = [("page", "page"), ("page_no", "page"), ("pageNo", "page"), ("p", "page"),
+              ("offset", "offset"), ("start", "offset"), ("skip", "offset")]
+_page_mode = (EPISODE_PAGE_PARAM, EPISODE_PAGE_MODE) if EPISODE_PAGE_PARAM else None
+
+
+def _ep_key(ep: dict) -> str:
+    v = first(ep, "entity_id", "story_id", "id", "episode_id")
+    return str(v) if v is not None else json.dumps(ep, sort_keys=True, default=str)[:200]
+
+
+async def _details_page(id_param: str, show_id: str, extra: dict):
+    params = {id_param: show_id, **extra}
+    if EPISODE_LIMIT_PARAM:
+        params.setdefault(EPISODE_LIMIT_PARAM, EPISODE_LIMIT)
+    payload = await api_request("GET", "/show-details-story", params=params)
+    details = payload.get("data", payload) if isinstance(payload, dict) else {}
+    return payload, details, find_episode_list(details)
+
+
+def _page_extra(mode, page_no: int, have: int) -> dict:
+    name, kind = mode
+    return {name: page_no} if kind == "page" else {name: have}
+
+
+async def _fetch_remaining_pages(id_param, show_id, episodes, details, progress=None):
+    """Page 1 is already in `episodes`. Keep fetching pages until nothing new comes back."""
+    global _page_mode
+    total = shallow_find(details, "total_episodes", "total_count", "total", "episode_count", "episodes_count")
+    try:
+        if total and len(episodes) >= int(total):
+            return episodes
+    except (TypeError, ValueError):
+        pass
+
+    seen = {_ep_key(e) for e in episodes}
+    all_eps = list(episodes)
+    mode = _page_mode
+    candidates = [mode] if mode else PAGE_MODES
+
+    # find which pagination parameter the API actually honours
+    if not mode:
+        for cand in candidates:
+            try:
+                _, _, eps = await _details_page(id_param, show_id, _page_extra(cand, 2, len(all_eps)))
+            except ApiError as e:
+                if e.status == 429:
+                    raise
+                continue
+            new = [e for e in eps if _ep_key(e) not in seen]
+            if new:
+                mode = _page_mode = cand
+                for e in new:
+                    seen.add(_ep_key(e))
+                    all_eps.append(e)
+                logger.info("Pagination detected: %s", cand)
+                break
+        if not mode:
+            logger.warning("No pagination param worked; only %d episodes available. Run /debugshow and set "
+                           "EPISODE_PAGE_PARAM in .env", len(all_eps))
+            return all_eps
+        page_no = 3
+    else:
+        page_no = 2
+
+    while page_no <= MAX_EPISODE_PAGES:
+        if progress:
+            await progress(len(all_eps))
+        _, _, eps = await _details_page(id_param, show_id, _page_extra(mode, page_no, len(all_eps)))
+        new = [e for e in eps if _ep_key(e) not in seen]
+        if not new:
+            break
+        for e in new:
+            seen.add(_ep_key(e))
+            all_eps.append(e)
+        page_no += 1
+    return all_eps
+
+
+async def fetch_show_details(show_id: str, progress=None):
     global SHOW_PARAMS
     last_err = None
     for p in SHOW_PARAMS:
         try:
-            payload = await api_request("GET", "/show-details-story", params={p: show_id})
+            payload, details, episodes = await _details_page(p, show_id, _page_extra(_page_mode, 1, 0) if _page_mode else {})
         except ApiError as e:
             if e.status == 429:
                 raise
             last_err = e
             continue
-        details = payload.get("data", payload) if isinstance(payload, dict) else {}
-        episodes = find_episode_list(details)
         if episodes:
             SHOW_PARAMS = (p,) + tuple(x for x in SHOW_PARAMS if x != p)
             name = get_show_name(details)
-            return name, episodes
+            sort_order = get_sort_order(details)
+            episodes = await _fetch_remaining_pages(p, show_id, episodes, details, progress)
+            return name, episodes, sort_order
         logger.warning("show-details with %s returned no episodes: %s", p, str(payload)[:400])
     raise last_err or ApiError("No episodes found (admin: try /debugshow)")
 
@@ -327,9 +437,9 @@ async def fetch_show_details(show_id: str):
 async def fetch_player(show_id: str, ep_id: str):
     global PLAYER_KEYS
     last_err = None
-    for ks, ke in PLAYER_KEYS:
+    for tpl in PLAYER_KEYS:
         try:
-            payload = await api_request("POST", "/player", json={ks: show_id, ke: ep_id})
+            payload = await api_request("POST", "/player", json=player_body(tpl, show_id, ep_id))
         except ApiError as e:
             if e.status == 429:
                 raise
@@ -337,10 +447,10 @@ async def fetch_player(show_id: str, ep_id: str):
             continue
         url = find_url(payload)
         if url:
-            PLAYER_KEYS = ((ks, ke),) + tuple(x for x in PLAYER_KEYS if x != (ks, ke))
+            PLAYER_KEYS = (tpl,) + tuple(x for x in PLAYER_KEYS if x != tpl)
             data = payload.get("data", payload) if isinstance(payload, dict) else {}
-            return url, shallow_find(data, "episode_title", "title", "name")
-        logger.warning("player with %s/%s returned no url: %s", ks, ke, str(payload)[:400])
+            return url, shallow_find(data, "episode_title", "story_title", "title", "name")
+        logger.warning("player %s returned no url: %s", dict(tpl), str(payload)[:400])
     if last_err:
         raise last_err
     return None, None
@@ -388,8 +498,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_user(update)
     await update.message.reply_text(
         "👋 <b>Welcome to Pocket FM Bot!</b>\n\n"
-        "Search any audio series using:\n<code>/search show title</code>\n\n"
-        "Example:\n<code>/search Instamillionaire</code>",
+        "1. Search a series:\n<code>/search show title</code>\n"
+        "2. Pick the show from the list\n"
+        "3. Send the episode number(s) you want, e.g. <code>340</code> or <code>340-344</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -442,24 +553,40 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Unexpected error: {esc(type(e).__name__)}")
 
 
-def episode_keyboard(show_id: str, episodes: list, page: int) -> InlineKeyboardMarkup:
-    ks = reg(show_id)
-    start = page * PAGE_SIZE
-    rows = []
-    for i, ep in enumerate(episodes[start:start + PAGE_SIZE], start=start + 1):
-        ep_id = first(ep, "entity_id", "story_id", "id", "episode_id")
-        if ep_id is None:
+def build_number_map(episodes: list, sort_order: str = "asc") -> dict:
+    """Map episode number -> episode dict. Uses a number field if the API has one, else list position."""
+    for key in ("episode_number", "sequence_number", "episode_no", "seq_number", "story_number", "number", "index"):
+        try:
+            ints = [int(ep[key]) for ep in episodes]
+        except (KeyError, TypeError, ValueError):
             continue
-        title = first(ep, "title", "story_title", "episode_title", "name") or f"Episode {first(ep, 'episode_number', 'number', default=i)}"
-        rows.append([InlineKeyboardButton(f"⬇️ {str(title)[:38]}", callback_data=f"dl|{ks}|{reg(ep_id)}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pg|{ks}|{page - 1}"))
-    if start + PAGE_SIZE < len(episodes):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pg|{ks}|{page + 1}"))
-    if nav:
-        rows.append(nav)
-    return InlineKeyboardMarkup(rows)
+        if len(set(ints)) == len(ints):
+            if min(ints) == 0:
+                ints = [i + 1 for i in ints]
+            return dict(zip(ints, episodes))
+    ordered = list(reversed(episodes)) if sort_order == "desc" else list(episodes)
+    return {i + 1: ep for i, ep in enumerate(ordered)}
+
+
+def parse_ranges(text: str):
+    """'340', '340-344', '1,3,10-12', '5 to 7' -> [numbers]; None if the text isn't a valid selection."""
+    t = re.sub(r"\s*(?:-|–|—|\bto\b)\s*", "-", text.strip().lower())
+    nums, seen = [], set()
+    for tok in re.split(r"[,\s]+", t):
+        if not tok:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
+        if not m:
+            return None
+        lo = int(m.group(1))
+        hi = int(m.group(2)) if m.group(2) else lo
+        if hi < lo or hi - lo > 500:
+            return None
+        for n in range(lo, hi + 1):
+            if n not in seen:
+                seen.add(n)
+                nums.append(n)
+    return nums or None
 
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,90 +594,158 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     track_user(update)
     parts = q.data.split("|")
-    action = parts[0]
-    uid = q.from_user.id
+    if parts[0] != "sh":
+        return
+    show_id = unreg(parts[1])
+    if not show_id:
+        await q.edit_message_text("⚠️ Button expired. Please search again.")
+        return
     cache = context.bot_data.setdefault("episodes", {})
+    try:
+        entry = cache.get(show_id)
+        if not entry or time.time() - entry["ts"] > EPISODE_CACHE_TTL:
+            await q.edit_message_text("⏳ Fetching episodes list...")
 
-    # ---- show selected / page change ----
-    if action in ("sh", "pg"):
-        show_id = unreg(parts[1])
-        if not show_id:
-            await q.edit_message_text("⚠️ Button expired. Please search again.")
-            return
-        page = int(parts[2]) if action == "pg" else 0
-        try:
-            if show_id not in cache:
-                await q.edit_message_text("⏳ Fetching episodes list...")
-                name, episodes = await fetch_show_details(show_id)
-                cache[show_id] = {"name": name, "episodes": episodes}
-            entry = cache[show_id]
-            await q.edit_message_text(
-                f"🎧 <b>{esc(entry['name'])}</b>\nSelect an episode ({len(entry['episodes'])} total):",
-                reply_markup=episode_keyboard(show_id, entry["episodes"], page),
-                parse_mode=ParseMode.HTML,
+            async def progress(n):
+                try:
+                    await q.edit_message_text(f"⏳ Fetching episodes list... ({n} found so far)")
+                except Exception:
+                    pass
+
+            name, episodes, sort_order = await fetch_show_details(show_id, progress)
+            by_number = build_number_map(episodes, sort_order)
+            entry = {"name": name, "by_number": by_number, "ts": time.time()}
+            cache[show_id] = entry
+
+        by_number = entry["by_number"]
+        lo, hi = min(by_number), max(by_number)
+        context.user_data["show_id"] = show_id
+        t_lo = first(by_number[lo], "title", "story_title", "episode_title", "name", default="")
+        t_hi = first(by_number[hi], "title", "story_title", "episode_title", "name", default="")
+        await q.edit_message_text(
+            f"🎧 <b>{esc(entry['name'])}</b>\n"
+            f"📚 <b>{len(by_number)}</b> episodes available (#{lo} to #{hi})\n"
+            f"First: {esc(str(t_lo)[:40])}\nLast: {esc(str(t_hi)[:40])}\n\n"
+            "Send the episode number(s) you want:\n"
+            "• <code>340</code>\n• <code>340-344</code>\n• <code>1,5,10-12</code>\n\n"
+            f"Max {MAX_BATCH} per request. /cancel to stop.",
+            parse_mode=ParseMode.HTML,
+        )
+    except ApiError as e:
+        await q.edit_message_text(f"❌ {esc(e)}", parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("Episode list failed")
+        await q.edit_message_text("❌ Failed to retrieve episode list.")
+
+
+async def send_episode(message, uid: int, show_id: str, num: int, ep: dict) -> bool:
+    ep_id = first(ep, "entity_id", "story_id", "id", "episode_id")
+    status = await message.reply_text(f"⚡ Episode {num}: generating link...")
+    file_path = None
+    try:
+        if ep_id is None:
+            await status.edit_text(f"❌ Episode {num}: no ID found in API data.")
+            return False
+        audio_url, raw_title = await fetch_player(show_id, str(ep_id))
+        raw_title = raw_title or first(ep, "title", "story_title", "episode_title", "name") or f"Episode_{num}"
+        if not audio_url:
+            log_event(uid, "download", f"{show_id}/{ep_id} locked", False)
+            await status.edit_text(f"🔒 Episode {num} is coin-locked or unavailable.")
+            return False
+
+        file_path = DOWNLOAD_DIR / f"{uid}_{num}_{clean_filename(raw_title)}.mp3"
+        if ".m3u8" in audio_url:
+            await status.edit_text(f"⏳ Episode {num}: processing stream via FFmpeg...")
+            await fetch_hls_stream(audio_url, file_path)
+        else:
+            await status.edit_text(f"📥 Episode {num}: downloading...")
+            await fetch_direct_audio(audio_url, file_path)
+
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_MB:
+            log_event(uid, "download", f"{show_id}/{ep_id} too big", False)
+            await status.edit_text(f"⚠️ Episode {num} is {size_mb:.0f}MB, above Telegram's {MAX_UPLOAD_MB}MB bot limit.")
+            return False
+
+        await status.edit_text(f"📤 Episode {num}: uploading...")
+        with open(file_path, "rb") as f:
+            await message.reply_audio(
+                audio=f, title=str(raw_title), performer="Pocket FM",
+                caption=f"🎧 <b>{esc(raw_title)}</b>\nEpisode {num}", parse_mode=ParseMode.HTML,
+                read_timeout=300, write_timeout=300,
             )
-        except ApiError as e:
-            await q.edit_message_text(f"❌ {esc(e)}", parse_mode=ParseMode.HTML)
-        except Exception:
-            logger.exception("Episode list failed")
-            await q.edit_message_text("❌ Failed to retrieve episode list.")
+        log_event(uid, "download", f"{show_id}/{ep_id}", True)
+        await status.delete()
+        return True
+
+    except ApiError as e:
+        log_event(uid, "download", f"{show_id}/{ep_id}", False)
+        await status.edit_text(f"❌ Episode {num}: {esc(e)}", parse_mode=ParseMode.HTML)
+        if e.status == 429:
+            raise
+        return False
+    except Exception as e:
+        logger.exception("Download failed")
+        log_event(uid, "download", f"{show_id}/{ep_id}", False)
+        await status.edit_text(f"❌ Episode {num}: {esc(type(e).__name__)}: {esc(str(e)[:200])}", parse_mode=ParseMode.HTML)
+        return False
+    finally:
+        if file_path and file_path.exists():
+            file_path.unlink()
+
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_user(update)
+    uid = update.effective_user.id
+    show_id = context.user_data.get("show_id")
+    if not show_id:
+        await update.message.reply_text("Use <code>/search show title</code> first, then pick a show.", parse_mode=ParseMode.HTML)
+        return
+    entry = context.bot_data.get("episodes", {}).get(show_id)
+    if not entry:
+        await update.message.reply_text("⚠️ Session expired. Please /search again.")
         return
 
-    # ---- episode selected -> download ----
-    if action == "dl":
-        show_id, ep_id = unreg(parts[1]), unreg(parts[2])
-        if not show_id or not ep_id:
-            await q.message.reply_text("⚠️ Button expired. Please search again.")
-            return
-        status = await q.message.reply_text("⚡ Generating download link...")
-        file_path = None
-        try:
-            audio_url, raw_title = await fetch_player(show_id, ep_id)
-            if not raw_title:
-                for ep in cache.get(show_id, {}).get("episodes", []):
-                    if str(first(ep, "entity_id", "story_id", "id", "episode_id")) == ep_id:
-                        raw_title = first(ep, "title", "story_title", "episode_title", "name")
-                        break
-            raw_title = raw_title or f"Episode_{ep_id[:8]}"
-            if not audio_url:
-                log_event(uid, "download", f"{show_id}/{ep_id} locked", False)
-                await status.edit_text("🔒 This episode is coin-locked or unavailable.")
-                return
+    nums = parse_ranges(update.message.text)
+    if nums is None:
+        await update.message.reply_text(
+            "⚠️ Send episode numbers like <code>340</code>, <code>340-344</code> or <code>1,5,10-12</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    if len(nums) > MAX_BATCH:
+        await update.message.reply_text(f"⚠️ Max {MAX_BATCH} episodes per request (you asked for {len(nums)}).")
+        return
 
-            file_path = DOWNLOAD_DIR / f"{uid}_{clean_filename(raw_title)}.mp3"
-            if ".m3u8" in audio_url:
-                await status.edit_text("⏳ Processing HLS stream via FFmpeg...")
-                await fetch_hls_stream(audio_url, file_path)
-            else:
-                await status.edit_text("📥 Downloading audio file...")
-                await fetch_direct_audio(audio_url, file_path)
+    by_number = entry["by_number"]
+    missing = [n for n in nums if n not in by_number]
+    if missing:
+        await update.message.reply_text(
+            f"⚠️ Not available: {', '.join(map(str, missing[:15]))}\n"
+            f"Available: #{min(by_number)} to #{max(by_number)}")
+        return
 
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            if size_mb > MAX_UPLOAD_MB:
-                log_event(uid, "download", f"{show_id}/{ep_id} too big", False)
-                await status.edit_text(f"⚠️ File is {size_mb:.0f}MB, above Telegram's {MAX_UPLOAD_MB}MB bot limit.")
-                return
+    if context.user_data.get("busy"):
+        await update.message.reply_text("⏳ Still working on your previous request. Please wait.")
+        return
+    context.user_data["busy"] = True
+    try:
+        ok = 0
+        for n in nums:
+            try:
+                if await send_episode(update.message, uid, show_id, n, by_number[n]):
+                    ok += 1
+            except ApiError:
+                await update.message.reply_text("⛔ Rate limit hit, stopping. Try the remaining episodes in a minute.")
+                break
+        if len(nums) > 1:
+            await update.message.reply_text(f"✅ Done: {ok}/{len(nums)} episodes sent.")
+    finally:
+        context.user_data["busy"] = False
 
-            await status.edit_text("📤 Uploading audio to Telegram...")
-            with open(file_path, "rb") as f:
-                await q.message.reply_audio(
-                    audio=f, title=str(raw_title), performer="Pocket FM",
-                    caption=f"🎧 <b>{esc(raw_title)}</b>", parse_mode=ParseMode.HTML,
-                    read_timeout=300, write_timeout=300,
-                )
-            log_event(uid, "download", f"{show_id}/{ep_id}", True)
-            await status.delete()
 
-        except ApiError as e:
-            log_event(uid, "download", f"{show_id}/{ep_id}", False)
-            await status.edit_text(f"❌ {esc(e)}", parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.exception("Download failed")
-            log_event(uid, "download", f"{show_id}/{ep_id}", False)
-            await status.edit_text(f"❌ Error: {esc(type(e).__name__)}: {esc(str(e)[:200])}", parse_mode=ParseMode.HTML)
-        finally:
-            if file_path and file_path.exists():
-                file_path.unlink()
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("show_id", None)
+    await update.message.reply_text("Cancelled. Use /search to start again.")
 
 
 # ----------------- ADMIN HANDLERS -----------------
@@ -632,9 +827,12 @@ async def debugshow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or not context.args:
         return
     sid = context.args[0]
+    extra = {}
+    if len(context.args) >= 3:          # /debugshow <id> <param> <value>  e.g. /debugshow 123 page 2
+        extra = {context.args[1]: context.args[2]}
     for p in SHOW_PARAMS:
         try:
-            payload = await api_request("GET", "/show-details-story", params={p: sid})
+            payload = await api_request("GET", "/show-details-story", params={p: sid, **extra})
             await send_debug(update, payload, f"param={p}")
             return
         except Exception as e:
@@ -646,13 +844,18 @@ async def debugplay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update) or len(context.args) < 2:
         return
     sid, eid = context.args[:2]
-    for ks, ke in PLAYER_KEYS:
+    errors = []
+    for tpl in PLAYER_KEYS:
+        body = player_body(tpl, sid, eid)
         try:
-            payload = await api_request("POST", "/player", json={ks: sid, ke: eid})
-            await send_debug(update, payload, f"{ks}/{ke}")
+            payload = await api_request("POST", "/player", json=body)
+            await send_debug(update, payload, f"OK with {list(body)}")
             return
         except Exception as e:
-            await update.message.reply_text(f"{ks}/{ke}: {type(e).__name__}: {e}")
+            errors.append(f"{list(body)} -> {e}")
+            if getattr(e, "status", None) == 429:
+                break
+    await update.message.reply_text("All attempts failed:\n" + "\n".join(errors)[:3800])
 
 
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
@@ -678,7 +881,9 @@ def main():
     app.add_handler(CommandHandler("debug", debug_handler))
     app.add_handler(CommandHandler("debugshow", debugshow_handler))
     app.add_handler(CommandHandler("debugplay", debugplay_handler))
+    app.add_handler(CommandHandler("cancel", cancel_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(error_handler)
     logger.info("Bot online. Admins: %s", sorted(ADMIN_IDS) or "none set")
     app.run_polling()
