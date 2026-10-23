@@ -2,6 +2,7 @@ import os
 import re
 import html
 import hashlib
+import time
 import sqlite3
 import asyncio
 import logging
@@ -109,7 +110,17 @@ def log_event(user_id: int, kind: str, detail: str, ok: bool):
 
 # ----------------- API CLIENT -----------------
 class ApiError(Exception):
-    pass
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+# --- rate limiting: spacing between calls + retry on 429 ---
+MIN_INTERVAL = float(os.getenv("API_MIN_INTERVAL", "1.0"))   # seconds between API calls
+_api_lock = asyncio.Lock()
+_last_call = 0.0
+_search_cache = {}          # query -> (timestamp, payload)
+SEARCH_CACHE_TTL = 600      # 10 minutes
 
 
 def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
@@ -120,24 +131,45 @@ def make_client(timeout: float = 30.0) -> httpx.AsyncClient:
 
 
 async def api_request(method: str, path: str, *, params=None, json=None):
+    global _last_call
     url = f"{API_BASE}{path}"
-    async with make_client() as client:
-        try:
-            resp = await client.request(method, url, params=params, json=json)
-        except httpx.TimeoutException as e:
-            raise ApiError(f"Timeout reaching API ({type(e).__name__})") from e
-        except httpx.HTTPError as e:
-            raise ApiError(f"Network error: {type(e).__name__}: {e}") from e
+    for attempt in range(3):
+        async with _api_lock:
+            wait = MIN_INTERVAL - (time.monotonic() - _last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _last_call = time.monotonic()
 
-    logger.info("%s %s -> %s", method, resp.url, resp.status_code)
-    if resp.status_code >= 400:
-        logger.error("API body: %s", resp.text[:500])
-        raise ApiError(f"API returned HTTP {resp.status_code}")
-    try:
-        return resp.json()
-    except ValueError:
-        logger.error("Non-JSON body: %s", resp.text[:500])
-        raise ApiError("API did not return JSON")
+        async with make_client() as client:
+            try:
+                resp = await client.request(method, url, params=params, json=json)
+            except httpx.TimeoutException as e:
+                raise ApiError(f"Timeout reaching API ({type(e).__name__})") from e
+            except httpx.HTTPError as e:
+                raise ApiError(f"Network error: {type(e).__name__}: {e}") from e
+
+        logger.info("%s %s -> %s", method, resp.url, resp.status_code)
+
+        if resp.status_code == 429:
+            ra = resp.headers.get("Retry-After", "")
+            try:
+                delay = min(float(ra), 30.0)
+            except ValueError:
+                delay = 3.0 * (attempt + 1)
+            logger.warning("429 rate limited (Retry-After=%r, body=%s)", ra, resp.text[:200])
+            if attempt < 2:
+                await asyncio.sleep(delay)
+                continue
+            raise ApiError("API rate limit reached (HTTP 429). Please wait a minute and try again.", 429)
+
+        if resp.status_code >= 400:
+            logger.error("API body: %s", resp.text[:500])
+            raise ApiError(f"API returned HTTP {resp.status_code}", resp.status_code)
+        try:
+            return resp.json()
+        except ValueError:
+            logger.error("Non-JSON body: %s", resp.text[:500])
+            raise ApiError("API did not return JSON")
 
 
 LIST_KEYS = ("shows", "episodes", "results", "result", "stories", "items", "list", "data")
@@ -221,16 +253,20 @@ PLAYER_KEYS = (("story_id", "episode_id"), ("show_id", "episode_id"),
 
 
 async def fetch_show_details(show_id: str):
+    global SHOW_PARAMS
     last_err = None
     for p in SHOW_PARAMS:
         try:
             payload = await api_request("GET", "/show-details-story", params={p: show_id})
         except ApiError as e:
+            if e.status == 429:
+                raise
             last_err = e
             continue
         details = payload.get("data", payload) if isinstance(payload, dict) else {}
         episodes = [e for e in find_list(details) if isinstance(e, dict)]
         if episodes:
+            SHOW_PARAMS = (p,) + tuple(x for x in SHOW_PARAMS if x != p)
             name = shallow_find(details, "title", "name", "show_title") or "Episodes"
             return name, episodes
         logger.warning("show-details with %s returned no episodes: %s", p, str(payload)[:400])
@@ -238,15 +274,19 @@ async def fetch_show_details(show_id: str):
 
 
 async def fetch_player(show_id: str, ep_id: str):
+    global PLAYER_KEYS
     last_err = None
     for ks, ke in PLAYER_KEYS:
         try:
             payload = await api_request("POST", "/player", json={ks: show_id, ke: ep_id})
         except ApiError as e:
+            if e.status == 429:
+                raise
             last_err = e
             continue
         url = find_url(payload)
         if url:
+            PLAYER_KEYS = ((ks, ke),) + tuple(x for x in PLAYER_KEYS if x != (ks, ke))
             data = payload.get("data", payload) if isinstance(payload, dict) else {}
             return url, shallow_find(data, "episode_title", "title", "name")
         logger.warning("player with %s/%s returned no url: %s", ks, ke, str(payload)[:400])
@@ -313,7 +353,14 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = await update.message.reply_text(f"🔍 Searching for <b>{esc(query)}</b>...", parse_mode=ParseMode.HTML)
     try:
-        payload = await api_request("GET", SEARCH_PATH, params={SEARCH_PARAM: query})
+        cached = _search_cache.get(query.lower())
+        if cached and time.time() - cached[0] < SEARCH_CACHE_TTL:
+            payload = cached[1]
+        else:
+            payload = await api_request("GET", SEARCH_PATH, params={SEARCH_PARAM: query})
+            _search_cache[query.lower()] = (time.time(), payload)
+            if len(_search_cache) > 200:
+                _search_cache.pop(next(iter(_search_cache)))
         shows = find_list(payload)
         if not shows:
             log_event(uid, "search", query, True)
