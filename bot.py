@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import hashlib
 import sqlite3
 import asyncio
 import logging
@@ -65,6 +66,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS events(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
             kind TEXT, detail TEXT, ok INTEGER, ts TEXT);
+        CREATE TABLE IF NOT EXISTS ids(key TEXT PRIMARY KEY, value TEXT);
         """)
 
 
@@ -82,6 +84,21 @@ def track_user(update: Update):
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, last_seen=excluded.last_seen",
             (u.id, u.username or "", now(), now()),
         )
+
+
+def reg(value) -> str:
+    """Short key for long IDs (Telegram callback_data is limited to 64 bytes)."""
+    value = str(value)
+    key = hashlib.md5(value.encode()).hexdigest()[:10]
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO ids(key, value) VALUES(?,?)", (key, value))
+    return key
+
+
+def unreg(key: str):
+    with db() as c:
+        row = c.execute("SELECT value FROM ids WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
 
 
 def log_event(user_id: int, kind: str, detail: str, ok: bool):
@@ -123,25 +140,35 @@ async def api_request(method: str, path: str, *, params=None, json=None):
         raise ApiError("API did not return JSON")
 
 
-LIST_KEYS = ("results", "stories", "shows", "items", "list", "episodes", "data")
+LIST_KEYS = ("shows", "episodes", "results", "result", "stories", "items", "list", "data")
 
 
-def find_list(payload):
-    """Find a list of dicts in whatever shape the API returns."""
+def find_list(payload, depth=0):
+    """Find the main list of dicts in whatever shape the API returns (e.g. data.result.shows)."""
+    if depth > 6:
+        return []
     if isinstance(payload, list):
         return payload
-    if isinstance(payload, dict):
-        for k in LIST_KEYS:
-            v = payload.get(k)
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict):
-                found = find_list(v)
-                if found:
-                    return found
-        for v in payload.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
+    if not isinstance(payload, dict):
+        return []
+    for k in LIST_KEYS:
+        v = payload.get(k)
+        if isinstance(v, list) and v:
+            return v
+    for k in LIST_KEYS:
+        v = payload.get(k)
+        if isinstance(v, dict):
+            found = find_list(v, depth + 1)
+            if found:
+                return found
+    for v in payload.values():
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v
+    for v in payload.values():
+        if isinstance(v, dict):
+            found = find_list(v, depth + 1)
+            if found:
+                return found
     return []
 
 
@@ -150,6 +177,82 @@ def first(d: dict, *keys, default=None):
         if d.get(k) not in (None, ""):
             return d[k]
     return default
+
+
+def shallow_find(obj, *keys):
+    """Look for a key at the top level or one dict level down (not inside lists)."""
+    if not isinstance(obj, dict):
+        return None
+    v = first(obj, *keys)
+    if v is not None:
+        return v
+    for child in obj.values():
+        if isinstance(child, dict):
+            v = first(child, *keys)
+            if v is not None:
+                return v
+    return None
+
+
+def find_url(obj, depth=0):
+    """DFS for an audio url under common key names."""
+    if depth > 6:
+        return None
+    if isinstance(obj, dict):
+        for k in ("media_url", "audio_url", "stream_url", "hls_url", "url"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        for v in obj.values():
+            r = find_url(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_url(v, depth + 1)
+            if r:
+                return r
+    return None
+
+
+SHOW_PARAMS = ("story_id", "show_id", "entity_id")
+PLAYER_KEYS = (("story_id", "episode_id"), ("show_id", "episode_id"),
+               ("entity_id", "episode_id"), ("show_id", "entity_id"))
+
+
+async def fetch_show_details(show_id: str):
+    last_err = None
+    for p in SHOW_PARAMS:
+        try:
+            payload = await api_request("GET", "/show-details-story", params={p: show_id})
+        except ApiError as e:
+            last_err = e
+            continue
+        details = payload.get("data", payload) if isinstance(payload, dict) else {}
+        episodes = [e for e in find_list(details) if isinstance(e, dict)]
+        if episodes:
+            name = shallow_find(details, "title", "name", "show_title") or "Episodes"
+            return name, episodes
+        logger.warning("show-details with %s returned no episodes: %s", p, str(payload)[:400])
+    raise last_err or ApiError("No episodes found (admin: try /debugshow)")
+
+
+async def fetch_player(show_id: str, ep_id: str):
+    last_err = None
+    for ks, ke in PLAYER_KEYS:
+        try:
+            payload = await api_request("POST", "/player", json={ks: show_id, ke: ep_id})
+        except ApiError as e:
+            last_err = e
+            continue
+        url = find_url(payload)
+        if url:
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            return url, shallow_find(data, "episode_title", "title", "name")
+        logger.warning("player with %s/%s returned no url: %s", ks, ke, str(payload)[:400])
+    if last_err:
+        raise last_err
+    return None, None
 
 
 # ----------------- DOWNLOAD HELPERS -----------------
@@ -222,9 +325,9 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not isinstance(item, dict):
                 continue
             title = first(item, "title", "name", "show_title", default="Story")
-            sid = first(item, "id", "story_id", "show_id")
+            sid = first(item, "entity_id", "id", "story_id", "show_id")
             if sid is not None:
-                buttons.append([InlineKeyboardButton(f"📖 {str(title)[:40]}", callback_data=f"sh|{sid}")])
+                buttons.append([InlineKeyboardButton(f"📖 {str(title)[:40]}", callback_data=f"sh|{reg(sid)}")])
         if not buttons:
             logger.error("Search payload had no usable ids: %s", str(payload)[:500])
             raise ApiError("Unexpected API response format")
@@ -242,17 +345,20 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def episode_keyboard(show_id: str, episodes: list, page: int) -> InlineKeyboardMarkup:
+    ks = reg(show_id)
     start = page * PAGE_SIZE
     rows = []
-    for ep in episodes[start:start + PAGE_SIZE]:
-        ep_id = first(ep, "id", "episode_id")
-        title = first(ep, "title", "episode_title") or f"Episode {first(ep, 'episode_number', 'number', default='')}"
-        rows.append([InlineKeyboardButton(f"⬇️ {str(title)[:38]}", callback_data=f"dl|{show_id}|{ep_id}")])
+    for i, ep in enumerate(episodes[start:start + PAGE_SIZE], start=start + 1):
+        ep_id = first(ep, "entity_id", "id", "episode_id")
+        if ep_id is None:
+            continue
+        title = first(ep, "title", "episode_title", "name") or f"Episode {first(ep, 'episode_number', 'number', default=i)}"
+        rows.append([InlineKeyboardButton(f"⬇️ {str(title)[:38]}", callback_data=f"dl|{ks}|{reg(ep_id)}")])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pg|{show_id}|{page - 1}"))
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pg|{ks}|{page - 1}"))
     if start + PAGE_SIZE < len(episodes):
-        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pg|{show_id}|{page + 1}"))
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"pg|{ks}|{page + 1}"))
     if nav:
         rows.append(nav)
     return InlineKeyboardMarkup(rows)
@@ -269,20 +375,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- show selected / page change ----
     if action in ("sh", "pg"):
-        show_id = parts[1]
+        show_id = unreg(parts[1])
+        if not show_id:
+            await q.edit_message_text("⚠️ Button expired. Please search again.")
+            return
         page = int(parts[2]) if action == "pg" else 0
         try:
             if show_id not in cache:
                 await q.edit_message_text("⏳ Fetching episodes list...")
-                payload = await api_request("GET", "/show-details-story", params={"story_id": show_id})
-                details = payload.get("data", payload) if isinstance(payload, dict) else {}
-                episodes = find_list(details.get("episodes") if isinstance(details, dict) and "episodes" in details else details)
-                name = first(details, "title", "name", default="Episodes") if isinstance(details, dict) else "Episodes"
-                cache[show_id] = {"name": name, "episodes": [e for e in episodes if isinstance(e, dict)]}
+                name, episodes = await fetch_show_details(show_id)
+                cache[show_id] = {"name": name, "episodes": episodes}
             entry = cache[show_id]
-            if not entry["episodes"]:
-                await q.edit_message_text("❌ No episodes available for this show.")
-                return
             await q.edit_message_text(
                 f"🎧 <b>{esc(entry['name'])}</b>\nSelect an episode ({len(entry['episodes'])} total):",
                 reply_markup=episode_keyboard(show_id, entry["episodes"], page),
@@ -297,14 +400,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---- episode selected -> download ----
     if action == "dl":
-        _, show_id, ep_id = parts
+        show_id, ep_id = unreg(parts[1]), unreg(parts[2])
+        if not show_id or not ep_id:
+            await q.message.reply_text("⚠️ Button expired. Please search again.")
+            return
         status = await q.message.reply_text("⚡ Generating download link...")
         file_path = None
         try:
-            payload = await api_request("POST", "/player", json={"story_id": show_id, "episode_id": ep_id})
-            pdata = payload.get("data", payload) if isinstance(payload, dict) else {}
-            audio_url = first(pdata, "media_url", "audio_url", "stream_url", "url")
-            raw_title = first(pdata, "episode_title", "title", default=f"Episode_{ep_id}")
+            audio_url, raw_title = await fetch_player(show_id, ep_id)
+            if not raw_title:
+                for ep in cache.get(show_id, {}).get("episodes", []):
+                    if str(first(ep, "entity_id", "id", "episode_id")) == ep_id:
+                        raw_title = first(ep, "title", "episode_title", "name")
+                        break
+            raw_title = raw_title or f"Episode_{ep_id[:8]}"
             if not audio_url:
                 log_event(uid, "download", f"{show_id}/{ep_id} locked", False)
                 await status.edit_text("🔒 This episode is coin-locked or unavailable.")
@@ -412,6 +521,34 @@ async def debug_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{type(e).__name__}: {e}")
 
 
+async def debugshow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: /debugshow <show_entity_id> dumps raw show-details response."""
+    if not is_admin(update) or not context.args:
+        return
+    sid = context.args[0]
+    for p in SHOW_PARAMS:
+        try:
+            payload = await api_request("GET", "/show-details-story", params={p: sid})
+            await update.message.reply_text(f"<b>param={p}</b>\n<pre>{esc(str(payload)[:3300])}</pre>", parse_mode=ParseMode.HTML)
+            return
+        except Exception as e:
+            await update.message.reply_text(f"param={p}: {type(e).__name__}: {e}")
+
+
+async def debugplay_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: /debugplay <show_id> <episode_id> dumps raw player response."""
+    if not is_admin(update) or len(context.args) < 2:
+        return
+    sid, eid = context.args[:2]
+    for ks, ke in PLAYER_KEYS:
+        try:
+            payload = await api_request("POST", "/player", json={ks: sid, ke: eid})
+            await update.message.reply_text(f"<b>{ks}/{ke}</b>\n<pre>{esc(str(payload)[:3300])}</pre>", parse_mode=ParseMode.HTML)
+            return
+        except Exception as e:
+            await update.message.reply_text(f"{ks}/{ke}: {type(e).__name__}: {e}")
+
+
 async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Unhandled error", exc_info=context.error)
 
@@ -433,6 +570,8 @@ def main():
     app.add_handler(CommandHandler("users", users_handler))
     app.add_handler(CommandHandler("broadcast", broadcast_handler))
     app.add_handler(CommandHandler("debug", debug_handler))
+    app.add_handler(CommandHandler("debugshow", debugshow_handler))
+    app.add_handler(CommandHandler("debugplay", debugplay_handler))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_error_handler(error_handler)
     logger.info("Bot online. Admins: %s", sorted(ADMIN_IDS) or "none set")
