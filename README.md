@@ -19,9 +19,14 @@ journalctl -u pocketfm-bot -f  # live logs
 Run `/debug <title>` as admin to see the raw API response, and check logs.
 Match `SEARCH_PATH` / `SEARCH_PARAM` in `.env` to your working curl command.
 
-## Episode pages (8 per page)
-The API returns ~8 episodes per request. After you pick a show, the bot now fetches **all** pages
-(auto-detects `page` / `offset`) so you can type any number: `340`, `340-345`, `1,5,10-12`.
-First load of a long show takes a while (rate-limited, ~1 call/sec); the list is cached for 1 hour.
-If it still only sees 8 episodes, as admin run `/debugshow <show_id> page 2` (or `offset 8`) to see
-which param works, then set `EPISODE_PAGE_PARAM` / `EPISODE_PAGE_MODE` in `.env`.
+## Episode pages (8 per page) and API usage
+The API returns ~8 episodes per request, so the bot only fetches the pages it needs.
+- Picking a show: 1 call (0 if cached).
+- Typing `340-345`: fetches just the page(s) holding those episodes (usually 1-2 calls), then 1 `/player` call per episode.
+- Everything is cached in `bot.db` (survives restarts): 6h for oldest-first shows, 1h for newest-first ones.
+- `/stats` (admin) shows API calls total/today so you can watch usage.
+
+If it can't find the page parameter, run `/debugshow <show_id> page 2` (or `offset 8`) as admin,
+then pin it in `.env` (`EPISODE_PAGE_PARAM`, `EPISODE_PAGE_MODE`). Run `/debugshow <show_id>` once and
+check whether the response includes a total episode count; if it does not AND the list is newest-first,
+the bot has to walk all pages once for that show (many calls, then cached).

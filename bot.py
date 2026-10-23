@@ -36,13 +36,13 @@ SEARCH_PARAM = os.getenv("SEARCH_PARAM", "query")   # change if your curl uses q
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
 FORCE_IPV4 = os.getenv("FORCE_IPV4", "1") == "1"
 MAX_BATCH = int(os.getenv("MAX_BATCH", "20"))   # max episodes per request
-EPISODE_CACHE_TTL = 3600
+PAGE_CACHE_TTL = int(os.getenv("PAGE_CACHE_TTL", "21600"))   # 6h for ascending shows (stable); 1h if newest-first
 # --- episode pagination (the API returns only ~8 episodes per page) ---
 EPISODE_PAGE_PARAM = os.getenv("EPISODE_PAGE_PARAM", "").strip()    # pin the page param name, e.g. page / offset
 EPISODE_PAGE_MODE = os.getenv("EPISODE_PAGE_MODE", "page").strip()  # "page" (1,2,3..) or "offset" (0,8,16..) when pinned
 EPISODE_LIMIT_PARAM = os.getenv("EPISODE_LIMIT_PARAM", "").strip()  # optional page-size param, e.g. limit / per_page
 EPISODE_LIMIT = int(os.getenv("EPISODE_LIMIT", "100"))
-MAX_EPISODE_PAGES = int(os.getenv("MAX_EPISODE_PAGES", "200"))
+MAX_EPISODE_PAGES = int(os.getenv("MAX_EPISODE_PAGES", "200"))   # only used by the rare fallback
 MAX_UPLOAD_MB = 50
 
 if not BOT_TOKEN or not API_KEY:
@@ -79,6 +79,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
             kind TEXT, detail TEXT, ok INTEGER, ts TEXT);
         CREATE TABLE IF NOT EXISTS ids(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS page_cache(
+            show_id TEXT, page INTEGER, data TEXT, ts REAL, PRIMARY KEY(show_id, page));
         """)
 
 
@@ -160,6 +162,10 @@ async def api_request(method: str, path: str, *, params=None, json=None):
                 raise ApiError(f"Network error: {type(e).__name__}: {e}") from e
 
         logger.info("%s %s -> %s", method, resp.url, resp.status_code)
+        try:
+            log_event(0, "api", path, resp.status_code < 400)
+        except Exception:
+            pass
 
         if resp.status_code == 429:
             ra = resp.headers.get("Retry-After", "")
@@ -338,11 +344,43 @@ def player_body(tpl, show_id, ep_id):
 PAGE_MODES = [("page", "page"), ("page_no", "page"), ("pageNo", "page"), ("p", "page"),
               ("offset", "offset"), ("start", "offset"), ("skip", "offset")]
 _page_mode = (EPISODE_PAGE_PARAM, EPISODE_PAGE_MODE) if EPISODE_PAGE_PARAM else None
+NUM_KEYS = ("episode_number", "sequence_number", "episode_no", "seq_number", "story_number", "number", "index")
+TOTAL_KEYS = ("total_episodes", "total_count", "total_stories", "episode_count", "episodes_count", "total")
 
 
 def _ep_key(ep: dict) -> str:
     v = first(ep, "entity_id", "story_id", "id", "episode_id")
     return str(v) if v is not None else json.dumps(ep, sort_keys=True, default=str)[:200]
+
+
+# ---- persistent cache (survives restarts, so repeat requests cost 0 API calls) ----
+def cache_get(show_id: str, page: int, ttl: float):
+    with db() as c:
+        r = c.execute("SELECT data, ts FROM page_cache WHERE show_id=? AND page=?", (show_id, page)).fetchone()
+    if r and time.time() - r["ts"] < ttl:
+        return json.loads(r["data"])
+    return None
+
+
+def cache_put(show_id: str, page: int, data):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO page_cache(show_id, page, data, ts) VALUES(?,?,?,?)",
+                  (show_id, page, json.dumps(data, ensure_ascii=False), time.time()))
+
+
+def load_page_mode():
+    global _page_mode
+    if _page_mode:
+        return
+    with db() as c:
+        r = c.execute("SELECT value FROM ids WHERE key='page_mode'").fetchone()
+    if r:
+        _page_mode = tuple(json.loads(r[0]))
+
+
+def save_page_mode(mode):
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO ids(key, value) VALUES('page_mode', ?)", (json.dumps(list(mode)),))
 
 
 async def _details_page(id_param: str, show_id: str, extra: dict):
@@ -354,71 +392,32 @@ async def _details_page(id_param: str, show_id: str, extra: dict):
     return payload, details, find_episode_list(details)
 
 
-def _page_extra(mode, page_no: int, have: int) -> dict:
+def _page_extra(mode, page_no: int, size: int) -> dict:
     name, kind = mode
-    return {name: page_no} if kind == "page" else {name: have}
+    return {name: page_no} if kind == "page" else {name: (page_no - 1) * size}
 
 
-async def _fetch_remaining_pages(id_param, show_id, episodes, details, progress=None):
-    """Page 1 is already in `episodes`. Keep fetching pages until nothing new comes back."""
-    global _page_mode
-    total = shallow_find(details, "total_episodes", "total_count", "total", "episode_count", "episodes_count")
-    try:
-        if total and len(episodes) >= int(total):
-            return episodes
-    except (TypeError, ValueError):
-        pass
-
-    seen = {_ep_key(e) for e in episodes}
-    all_eps = list(episodes)
-    mode = _page_mode
-    candidates = [mode] if mode else PAGE_MODES
-
-    # find which pagination parameter the API actually honours
-    if not mode:
-        for cand in candidates:
-            try:
-                _, _, eps = await _details_page(id_param, show_id, _page_extra(cand, 2, len(all_eps)))
-            except ApiError as e:
-                if e.status == 429:
-                    raise
-                continue
-            new = [e for e in eps if _ep_key(e) not in seen]
-            if new:
-                mode = _page_mode = cand
-                for e in new:
-                    seen.add(_ep_key(e))
-                    all_eps.append(e)
-                logger.info("Pagination detected: %s", cand)
-                break
-        if not mode:
-            logger.warning("No pagination param worked; only %d episodes available. Run /debugshow and set "
-                           "EPISODE_PAGE_PARAM in .env", len(all_eps))
-            return all_eps
-        page_no = 3
-    else:
-        page_no = 2
-
-    while page_no <= MAX_EPISODE_PAGES:
-        if progress:
-            await progress(len(all_eps))
-        _, _, eps = await _details_page(id_param, show_id, _page_extra(mode, page_no, len(all_eps)))
-        new = [e for e in eps if _ep_key(e) not in seen]
-        if not new:
-            break
-        for e in new:
-            seen.add(_ep_key(e))
-            all_eps.append(e)
-        page_no += 1
-    return all_eps
+def get_total(details):
+    node = details
+    if isinstance(node, dict) and isinstance(node.get("result"), list) and node["result"]:
+        node = node["result"][0]
+    for src in (node, details):
+        v = shallow_find(src, *TOTAL_KEYS)
+        try:
+            if v is not None and int(v) > 0:
+                return int(v)
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
-async def fetch_show_details(show_id: str, progress=None):
+async def fetch_show_details(show_id: str):
+    """ONE API call: page 1 of the show (name, sort order, total if given, first episodes)."""
     global SHOW_PARAMS
     last_err = None
     for p in SHOW_PARAMS:
         try:
-            payload, details, episodes = await _details_page(p, show_id, _page_extra(_page_mode, 1, 0) if _page_mode else {})
+            payload, details, episodes = await _details_page(p, show_id, {})
         except ApiError as e:
             if e.status == 429:
                 raise
@@ -426,12 +425,132 @@ async def fetch_show_details(show_id: str, progress=None):
             continue
         if episodes:
             SHOW_PARAMS = (p,) + tuple(x for x in SHOW_PARAMS if x != p)
-            name = get_show_name(details)
-            sort_order = get_sort_order(details)
-            episodes = await _fetch_remaining_pages(p, show_id, episodes, details, progress)
-            return name, episodes, sort_order
+            return get_show_name(details), episodes, get_sort_order(details), get_total(details)
         logger.warning("show-details with %s returned no episodes: %s", p, str(payload)[:400])
     raise last_err or ApiError("No episodes found (admin: try /debugshow)")
+
+
+async def fetch_page_remote(show_id: str, page_no: int, size: int):
+    """Fetch exactly one page (>=2). The pagination param is detected once, then remembered on disk."""
+    global _page_mode
+    page1 = cache_get(show_id, 1, 10 ** 12) or []
+    page1_keys = {_ep_key(e) for e in page1}
+    id_param = SHOW_PARAMS[0]
+    if _page_mode:
+        _, _, eps = await _details_page(id_param, show_id, _page_extra(_page_mode, page_no, size))
+        return eps
+    for cand in PAGE_MODES:
+        try:
+            _, _, eps = await _details_page(id_param, show_id, _page_extra(cand, page_no, size))
+        except ApiError as e:
+            if e.status == 429:
+                raise
+            continue
+        if not eps:
+            # empty could mean "past the end" for a correct param; only trust it if page 1 is also tiny
+            continue
+        if page1_keys and {_ep_key(e) for e in eps} & page1_keys:
+            continue          # same episodes as page 1 -> this param is ignored by the API
+        _page_mode = cand
+        save_page_mode(cand)
+        logger.info("Pagination param detected and saved: %s", cand)
+        return eps
+    raise ApiError("Couldn't find the API's page parameter. Admin: run /debugshow <id> page 2 and set "
+                   "EPISODE_PAGE_PARAM in .env")
+
+
+def _numfield(eps):
+    for key in NUM_KEYS:
+        try:
+            ints = [int(e[key]) for e in eps]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if len(set(ints)) == len(ints):
+            return key, ints
+    return None, None
+
+
+async def load_show(show_id: str) -> dict:
+    """Meta about a show. Costs 1 API call the first time, 0 afterwards."""
+    meta = cache_get(show_id, 0, 3600)
+    if meta:
+        return meta
+    name, eps, sort_order, total = await fetch_show_details(show_id)
+    key, ints = _numfield(eps)
+    zero = bool(key and min(ints) == 0)
+    if key and not total and sort_order == "desc":
+        total = max(ints) + (1 if zero else 0)
+    meta = {"name": name, "size": len(eps), "sort": sort_order, "total": total, "numfield": key, "zero": zero}
+    cache_put(show_id, 1, eps)
+    # rare fallback: newest-first list with no way to know the total -> we must walk the pages once
+    if sort_order == "desc" and not total:
+        n_pages, all_n, page_no = 1, len(eps), 2
+        while page_no <= MAX_EPISODE_PAGES:
+            more = await fetch_page_remote(show_id, page_no, meta["size"])
+            if not more:
+                break
+            cache_put(show_id, page_no, more)
+            all_n += len(more)
+            page_no += 1
+        meta["total"] = all_n
+    cache_put(show_id, 0, meta)
+    return meta
+
+
+async def get_page(show_id: str, meta: dict, page_no: int):
+    ttl = 3600 if meta["sort"] == "desc" else PAGE_CACHE_TTL
+    cached = cache_get(show_id, page_no, ttl)
+    if cached is not None:
+        return cached
+    eps = await fetch_page_remote(show_id, page_no, meta["size"]) if page_no > 1 else None
+    if page_no == 1:
+        _, eps, _, _ = await fetch_show_details(show_id)
+    cache_put(show_id, page_no, eps)
+    return eps
+
+
+def locate(meta: dict, n: int):
+    size = meta["size"] or 8
+    total = meta.get("total")
+    if total and n > total:
+        return None
+    if meta["sort"] == "desc":
+        if not total:
+            return None
+        pos = total - n + 1
+    else:
+        pos = n
+    if pos < 1:
+        return None
+    return (pos - 1) // size + 1, (pos - 1) % size
+
+
+async def resolve_episode(show_id: str, meta: dict, n: int):
+    loc = locate(meta, n)
+    if not loc:
+        return None
+    page, idx = loc
+    size = meta["size"] or 8
+    nf = meta.get("numfield")
+    for _ in range(2):
+        eps = await get_page(show_id, meta, page)
+        if not eps:
+            return None
+        if not nf:
+            return eps[idx] if idx < len(eps) else None
+        try:
+            nums = [int(e[nf]) + (1 if meta.get("zero") else 0) for e in eps]
+        except (KeyError, TypeError, ValueError):
+            return eps[idx] if idx < len(eps) else None
+        if n in nums:
+            return eps[nums.index(n)]
+        step = round((n - nums[len(nums) // 2]) / size)
+        if meta["sort"] == "desc":
+            step = -step
+        if step == 0 or page + step < 1:
+            return None
+        page += step
+    return None
 
 
 async def fetch_player(show_id: str, ep_id: str):
@@ -553,21 +672,6 @@ async def search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Unexpected error: {esc(type(e).__name__)}")
 
 
-def build_number_map(episodes: list, sort_order: str = "asc") -> dict:
-    """Map episode number -> episode dict. Uses a number field if the API has one, else list position."""
-    for key in ("episode_number", "sequence_number", "episode_no", "seq_number", "story_number", "number", "index"):
-        try:
-            ints = [int(ep[key]) for ep in episodes]
-        except (KeyError, TypeError, ValueError):
-            continue
-        if len(set(ints)) == len(ints):
-            if min(ints) == 0:
-                ints = [i + 1 for i in ints]
-            return dict(zip(ints, episodes))
-    ordered = list(reversed(episodes)) if sort_order == "desc" else list(episodes)
-    return {i + 1: ep for i, ep in enumerate(ordered)}
-
-
 def parse_ranges(text: str):
     """'340', '340-344', '1,3,10-12', '5 to 7' -> [numbers]; None if the text isn't a valid selection."""
     t = re.sub(r"\s*(?:-|–|—|\bto\b)\s*", "-", text.strip().lower())
@@ -600,32 +704,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not show_id:
         await q.edit_message_text("⚠️ Button expired. Please search again.")
         return
-    cache = context.bot_data.setdefault("episodes", {})
     try:
-        entry = cache.get(show_id)
-        if not entry or time.time() - entry["ts"] > EPISODE_CACHE_TTL:
-            await q.edit_message_text("⏳ Fetching episodes list...")
-
-            async def progress(n):
-                try:
-                    await q.edit_message_text(f"⏳ Fetching episodes list... ({n} found so far)")
-                except Exception:
-                    pass
-
-            name, episodes, sort_order = await fetch_show_details(show_id, progress)
-            by_number = build_number_map(episodes, sort_order)
-            entry = {"name": name, "by_number": by_number, "ts": time.time()}
-            cache[show_id] = entry
-
-        by_number = entry["by_number"]
-        lo, hi = min(by_number), max(by_number)
+        meta = cache_get(show_id, 0, 3600)
+        if not meta:
+            await q.edit_message_text("⏳ Loading show info...")
+            meta = await load_show(show_id)
         context.user_data["show_id"] = show_id
-        t_lo = first(by_number[lo], "title", "story_title", "episode_title", "name", default="")
-        t_hi = first(by_number[hi], "title", "story_title", "episode_title", "name", default="")
+        total = meta.get("total")
+        avail = f"📚 <b>{total}</b> episodes (#1 to #{total})" if total else "📚 Send any episode number"
         await q.edit_message_text(
-            f"🎧 <b>{esc(entry['name'])}</b>\n"
-            f"📚 <b>{len(by_number)}</b> episodes available (#{lo} to #{hi})\n"
-            f"First: {esc(str(t_lo)[:40])}\nLast: {esc(str(t_hi)[:40])}\n\n"
+            f"🎧 <b>{esc(meta['name'])}</b>\n{avail}\n\n"
             "Send the episode number(s) you want:\n"
             "• <code>340</code>\n• <code>340-344</code>\n• <code>1,5,10-12</code>\n\n"
             f"Max {MAX_BATCH} per request. /cancel to stop.",
@@ -634,8 +722,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ApiError as e:
         await q.edit_message_text(f"❌ {esc(e)}", parse_mode=ParseMode.HTML)
     except Exception:
-        logger.exception("Episode list failed")
-        await q.edit_message_text("❌ Failed to retrieve episode list.")
+        logger.exception("Show load failed")
+        await q.edit_message_text("❌ Failed to load the show.")
 
 
 async def send_episode(message, uid: int, show_id: str, num: int, ep: dict) -> bool:
@@ -701,10 +789,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not show_id:
         await update.message.reply_text("Use <code>/search show title</code> first, then pick a show.", parse_mode=ParseMode.HTML)
         return
-    entry = context.bot_data.get("episodes", {}).get(show_id)
-    if not entry:
-        await update.message.reply_text("⚠️ Session expired. Please /search again.")
-        return
 
     nums = parse_ranges(update.message.text)
     if nums is None:
@@ -716,23 +800,33 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Max {MAX_BATCH} episodes per request (you asked for {len(nums)}).")
         return
 
-    by_number = entry["by_number"]
-    missing = [n for n in nums if n not in by_number]
-    if missing:
-        await update.message.reply_text(
-            f"⚠️ Not available: {', '.join(map(str, missing[:15]))}\n"
-            f"Available: #{min(by_number)} to #{max(by_number)}")
-        return
-
     if context.user_data.get("busy"):
         await update.message.reply_text("⏳ Still working on your previous request. Please wait.")
         return
     context.user_data["busy"] = True
     try:
+        try:
+            meta = cache_get(show_id, 0, 3600) or await load_show(show_id)
+            resolved, missing = {}, []
+            for n in nums:                       # pages are cached, so 340-345 usually costs 1-2 calls total
+                ep = await resolve_episode(show_id, meta, n)
+                if ep is None:
+                    missing.append(n)
+                else:
+                    resolved[n] = ep
+        except ApiError as e:
+            await update.message.reply_text(f"❌ {esc(e)}", parse_mode=ParseMode.HTML)
+            return
+        if missing:
+            total = meta.get("total")
+            await update.message.reply_text(
+                f"⚠️ Not available: {', '.join(map(str, missing[:15]))}" + (f"\nAvailable: #1 to #{total}" if total else ""))
+            return
+
         ok = 0
         for n in nums:
             try:
-                if await send_episode(update.message, uid, show_id, n, by_number[n]):
+                if await send_episode(update.message, uid, show_id, n, resolved[n]):
                     ok += 1
             except ApiError:
                 await update.message.reply_text("⛔ Rate limit hit, stopping. Try the remaining episodes in a minute.")
@@ -762,13 +856,16 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         searches_today = one("SELECT COUNT(*) FROM events WHERE kind='search' AND ts LIKE ?", today + "%")
         dl_ok = one("SELECT COUNT(*) FROM events WHERE kind='download' AND ok=1")
         dl_today = one("SELECT COUNT(*) FROM events WHERE kind='download' AND ok=1 AND ts LIKE ?", today + "%")
-        failed = one("SELECT COUNT(*) FROM events WHERE ok=0")
+        failed = one("SELECT COUNT(*) FROM events WHERE ok=0 AND kind!='api'")
+        api_today = one("SELECT COUNT(*) FROM events WHERE kind='api' AND ts LIKE ?", today + "%")
+        api_total = one("SELECT COUNT(*) FROM events WHERE kind='api'")
     await update.message.reply_text(
         "📊 <b>Bot Stats</b>\n\n"
         f"👥 Users: <b>{users}</b> (new today {new_today}, active today {active_today})\n"
         f"🔍 Searches: <b>{searches}</b> (today {searches_today})\n"
         f"⬇️ Downloads: <b>{dl_ok}</b> (today {dl_today})\n"
-        f"⚠️ Failed actions: <b>{failed}</b>",
+        f"⚠️ Failed actions: <b>{failed}</b>\n"
+        f"🌐 API calls: <b>{api_total}</b> (today {api_today})",
         parse_mode=ParseMode.HTML,
     )
 
@@ -865,6 +962,7 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------- MAIN -----------------
 def main():
     init_db()
+    load_page_mode()
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
