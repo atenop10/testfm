@@ -248,12 +248,16 @@ def shallow_find(obj, *keys):
     return None
 
 
+AUDIO_KEYS = ("media_url", "audio_url", "stream_url", "hls_url", "file_url", "download_url", "audio", "url")
+AUDIO_EXT = (".m3u8", ".mp3", ".m4a", ".aac", ".mp4")
+
+
 def find_url(obj, depth=0):
-    """DFS for an audio url under common key names."""
+    """Find an audio url: known key names first, then any http string that looks like audio."""
     if depth > 6:
         return None
     if isinstance(obj, dict):
-        for k in ("media_url", "audio_url", "stream_url", "hls_url", "url"):
+        for k in AUDIO_KEYS:
             v = obj.get(k)
             if isinstance(v, str) and v.startswith("http"):
                 return v
@@ -266,6 +270,9 @@ def find_url(obj, depth=0):
             r = find_url(v, depth + 1)
             if r:
                 return r
+    elif isinstance(obj, str) and depth > 0 and obj.startswith("http") and \
+            any(ext in obj.split("?")[0].lower() for ext in AUDIO_EXT):
+        return obj
     return None
 
 
@@ -327,14 +334,14 @@ def shape(obj, depth=0):
 
 SHOW_PARAMS = ("story_id", "show_id", "entity_id")
 PLAYER_KEYS = (
-    (("show_id", "S"), ("story_id", "E")),
-    (("story_id", "S"), ("episode_id", "E")),
-    (("show_id", "S"), ("episode_id", "E")),
-    (("entity_id", "S"), ("episode_id", "E")),
-    (("story_id", "E"),),
-    (("episode_id", "E"),),
-    (("entity_id", "E"),),
+    (("show_id", "S"), ("story_id", "E")),     # what the API says it requires
 )
+if os.getenv("PLAYER_TRY_ALL", "0") == "1":    # old behaviour: try other body formats too (costs extra API calls)
+    PLAYER_KEYS += (
+        ((("story_id", "S"), ("episode_id", "E"))),
+        ((("show_id", "S"), ("episode_id", "E"))),
+        ((("entity_id", "S"), ("episode_id", "E"))),
+    )
 
 
 def player_body(tpl, show_id, ep_id):
@@ -555,23 +562,26 @@ async def resolve_episode(show_id: str, meta: dict, n: int):
 
 async def fetch_player(show_id: str, ep_id: str):
     global PLAYER_KEYS
-    last_err = None
+    first_err = None
     for tpl in PLAYER_KEYS:
         try:
             payload = await api_request("POST", "/player", json=player_body(tpl, show_id, ep_id))
         except ApiError as e:
             if e.status == 429:
                 raise
-            last_err = e
+            first_err = first_err or e
             continue
+        data = payload.get("data", payload) if isinstance(payload, dict) else {}
+        title = shallow_find(data, "episode_title", "story_title", "title", "name")
         url = find_url(payload)
         if url:
             PLAYER_KEYS = (tpl,) + tuple(x for x in PLAYER_KEYS if x != tpl)
-            data = payload.get("data", payload) if isinstance(payload, dict) else {}
-            return url, shallow_find(data, "episode_title", "story_title", "title", "name")
-        logger.warning("player %s returned no url: %s", dict(tpl), str(payload)[:400])
-    if last_err:
-        raise last_err
+            return url, title
+        # The API answered OK but gave no audio link -> episode is locked/unavailable. Don't burn more calls.
+        logger.warning("player %s/%s returned no audio url: %s", show_id, ep_id, str(payload)[:600])
+        return None, title
+    if first_err:
+        raise first_err
     return None, None
 
 
