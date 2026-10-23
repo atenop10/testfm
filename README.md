@@ -1,16 +1,18 @@
 # Pocket FM Telegram Bot
 
-### Quick Deployment
-1. Unzip the package:
-   ```bash
-   unzip pocketfm_bot.zip
-   cd pocketfm_bot
-   ```
-2. Make `setup.sh` executable and run it:
-   ```bash
-   chmod +x setup.sh
-   ./setup.sh
-   ```
-3. Test your bot on Telegram:
-   - Send `/start`
-   - Send `/search <show name>`
+## Deploy on a VPS (Ubuntu/Debian)
+```bash
+git clone <your-repo-url> pocketfm_bot && cd pocketfm_bot
+chmod +x setup.sh && ./setup.sh
+nano .env                      # fill token, API key, ADMIN_IDS
+sudo systemctl restart pocketfm-bot
+journalctl -u pocketfm-bot -f  # live logs
+```
+
+## Commands
+- `/start`, `/search <title>` - everyone
+- `/stats`, `/users`, `/broadcast <text>`, `/debug <query>` - admins only (ADMIN_IDS)
+
+## If search fails
+Run `/debug <title>` as admin to see the raw API response, and check logs.
+Match `SEARCH_PATH` / `SEARCH_PARAM` in `.env` to your working curl command.

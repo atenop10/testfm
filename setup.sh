@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 set -e
-
-echo "=== 1. Updating packages and installing FFmpeg & Python venv ==="
+echo "=== 1. Installing system packages ==="
 sudo apt-get update -y
 sudo apt-get install -y python3 python3-pip python3-venv ffmpeg
 
-echo "=== 2. Creating Python virtual environment ==="
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-    echo "Virtual environment created."
-fi
-
-echo "=== 3. Installing Python dependencies ==="
+echo "=== 2. Virtual environment + dependencies ==="
+[ -d venv ] || python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install python-telegram-bot httpx
+pip install -r requirements.txt
 
-echo "=== 4. Creating systemd background service ==="
+echo "=== 3. .env file ==="
+if [ ! -f .env ]; then
+  cp .env.example .env
+  echo "Created .env - EDIT IT NOW (nano .env), then run: sudo systemctl restart pocketfm-bot"
+fi
+
+echo "=== 4. systemd service ==="
 CURRENT_DIR=$(pwd)
 CURRENT_USER=$(whoami)
 SERVICE_NAME="pocketfm-bot"
-
-sudo bash -c "cat <<EOF > /etc/systemd/system/${SERVICE_NAME}.service
+sudo tee /etc/systemd/system/${SERVICE_NAME}.service >/dev/null <<UNIT
 [Unit]
-Description=Pocket FM Telegram Bot Service
-After=network.target
+Description=Pocket FM Telegram Bot
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -36,12 +36,9 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-EOF"
+UNIT
 
-echo "=== 5. Enabling and starting service ==="
 sudo systemctl daemon-reload
 sudo systemctl enable ${SERVICE_NAME}
 sudo systemctl restart ${SERVICE_NAME}
-
-echo "=== Setup complete! Service is active. ==="
-sudo systemctl status ${SERVICE_NAME} --no-pager
+echo "Done. Logs: journalctl -u ${SERVICE_NAME} -f"
